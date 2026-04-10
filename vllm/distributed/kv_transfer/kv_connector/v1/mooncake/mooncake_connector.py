@@ -20,14 +20,23 @@ import zmq.asyncio
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
+    BlockIds,
     EngineId,
     TpKVTopology,
     get_current_attn_backend,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
@@ -249,7 +258,7 @@ class MooncakeXferMetadata(
     remote_port: int
     remote_tp_size: int
     remote_tp_rank: int
-    req_blocks: dict[ReqId, tuple[TransferId, list[int]]]
+    req_blocks: dict[ReqId, tuple[TransferId, BlockIds]]
     kv_caches_base_addr: list[int]
     block_lens: list[int]
 
@@ -277,7 +286,7 @@ class MooncakeXferResponse(
 class PullReqMeta:
     d_req_id: ReqId
     transfer_id: TransferId
-    local_block_ids: list[int]
+    local_block_ids: BlockIds
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
     # Set expire time to avoid infinitely sending requests.
@@ -290,7 +299,7 @@ class PullReqMeta:
 class SendBlockMeta:
     p_req_id: ReqId
     transfer_id: TransferId
-    local_block_ids: list[int]
+    local_block_ids: BlockIds
     ready: asyncio.Event
     expire_time: float = float("inf")
     need_send: int = 0
@@ -303,13 +312,13 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         # Use (engine_id, dp_rank) to group reqs with same dp.
         # See comments in MooncakeBootstrapServer.
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
-        self.reqs_to_send: dict[ReqId, tuple[TransferId, list[int]]] = {}
+        self.reqs_to_send: dict[ReqId, tuple[TransferId, BlockIds]] = {}
         self.reqs_not_processed: set[TransferId] = set()
 
     def add_new_req(
         self,
         request_id: ReqId,
-        local_block_ids: list[int],
+        local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
     ):
@@ -327,7 +336,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
 
 
-class MooncakeConnector(KVConnectorBase_V1):
+class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -342,12 +351,12 @@ class MooncakeConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeConnectorScheduler | None = (
-                MooncakeConnectorScheduler(vllm_config, self.engine_id)
+                MooncakeConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)
             )
             self.connector_worker: MooncakeConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = MooncakeConnectorWorker(vllm_config, self.engine_id)
+            self.connector_worker = MooncakeConnectorWorker(vllm_config, self.engine_id, kv_cache_config)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig):
@@ -400,6 +409,14 @@ class MooncakeConnector(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
     ############################################################
@@ -442,8 +459,24 @@ class MooncakeConnector(KVConnectorBase_V1):
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        self.kv_cache_specs = [
+            g.kv_cache_spec for g in kv_cache_config.kv_cache_groups
+        ]
+        self.use_hybrid = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and any(
+                not isinstance(g.kv_cache_spec, (FullAttentionSpec, UniformTypeKVCacheSpecs))
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
+        self.num_swa_block = [
+            cdiv(g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size) + 1
+            if isinstance(g.kv_cache_spec, SlidingWindowSpec) else 0
+            for g in kv_cache_config.kv_cache_groups
+        ]
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -527,8 +560,11 @@ class MooncakeConnectorScheduler:
                 # If remote_blocks and num_external_tokens = 0, we have
                 # a full prefix cache hit on the D worker. We need to call
                 # send_notif in _read_blocks to free the memory on the P.
-                local_block_ids = (
-                    blocks.get_unhashed_block_ids() if num_external_tokens > 0 else []
+                unhashed_local_block_ids = (
+                    blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else ()
+                )
+                local_block_ids = self.get_sw_clipped_blocks(
+                        unhashed_local_block_ids
                 )
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (request, local_block_ids)
@@ -584,7 +620,7 @@ class MooncakeConnectorScheduler:
     def request_finished(
         self,
         request: "Request",
-        block_ids: list[int],
+        block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Once a request is finished, determine whether request blocks
@@ -627,18 +663,43 @@ class MooncakeConnectorScheduler:
 
         # TODO: check whether block_ids actually ever be 0. If not we could
         # remove the conditional below
-        delay_free_blocks = len(block_ids) > 0
+        num_delay_free_blocks = [len(group_block_ids) for group_block_ids in block_ids]
+        delay_free_blocks = sum(num_delay_free_blocks) > 0
 
         if delay_free_blocks:
             self._reqs_need_send[request.request_id] = (request, block_ids)
 
         return delay_free_blocks, None
 
+    def get_sw_clipped_blocks(self, block_ids: BlockIds) -> BlockIds:
+        """
+        Clip the number of blocks to the sliding window size for each kv cache group
+        that employs SWA.
+        This is necessary because the KV Cache manager initially allocates blocks for
+        the entire sequence length, and successively cleans up blocks that are outside
+        the window prior to the `request_finished_all_groups` hook.
+        """
+        if len(block_ids) == 0 or not self.use_hybrid:
+            # No blocks to clip eg Full prefix cache hit or not a hybrid model.
+            return block_ids
+        assert len(block_ids) == len(self.num_swa_block), (
+            "Number of KV cache groups must match"
+        )
+        # For non-SWA groups, blocks_per_sw is 0 so we return all block_ids unchanged
+        return tuple(
+            [
+                blocks[-self.blocks_per_sw[i] :]
+                if self.blocks_per_sw[i] > 0
+                else blocks
+                for i, blocks in enumerate(block_ids)
+            ]
+        )
+
 
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         if TransferEngine is None:
             logger.error("Mooncake is not available")
             raise RuntimeError("Mooncake is not available")
@@ -739,10 +800,28 @@ class MooncakeConnectorWorker:
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
 
+        self.kv_cache_config = kv_cache_config
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.use_mla = self.model_config.use_mla
+
+        self.kv_cache_specs = [
+            g.kv_cache_spec for g in kv_cache_config.kv_cache_groups
+        ]
+        self.use_hybrid = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and any(
+                not isinstance(g.kv_cache_spec, (FullAttentionSpec, UniformTypeKVCacheSpecs))
+                for g in kv_cache_config.kv_cache_groups
+            )
+        )
+        self.num_swa_block = [
+            cdiv(g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size) + 1
+            if isinstance(g.kv_cache_spec, SlidingWindowSpec) else 0
+            for g in kv_cache_config.kv_cache_groups
+        ]
+        
 
         # Get the attention backend from the first layer
         # NOTE (NickLucche) models with multiple backends are not supported yet
