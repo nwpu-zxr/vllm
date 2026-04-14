@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from vllm.v1.worker.utils import select_common_block_size
 import asyncio
 import logging
 import threading
@@ -22,8 +23,9 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
+    HeteroTPTransferConfig,
     TpKVTopology,
-    get_current_attn_backend,
+    get_current_attn_backends,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -34,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -51,6 +54,12 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+    MambaConvSplitInfo,
+    compute_mamba_phys_ratio,
+    derive_mamba_conv_split,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -261,6 +270,9 @@ class MooncakeXferMetadata(
     req_blocks: dict[ReqId, tuple[TransferId, BlockIds]]
     kv_caches_base_addr: list[int]
     block_lens: list[int]
+    ssm_sizes: tuple[int, int] = (0, 0)
+    engine_id: str
+    num_blocks: int
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -472,6 +484,10 @@ class MooncakeConnectorScheduler:
                 for g in kv_cache_config.kv_cache_groups
             )
         )
+        self._use_mamba = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in kv_cache_config.kv_cache_groups
+        )
         self.num_swa_block = [
             cdiv(g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size) + 1
             if isinstance(g.kv_cache_spec, SlidingWindowSpec) else 0
@@ -495,6 +511,32 @@ class MooncakeConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
+
+    def _truncate_mamba_request_for_prefill(self, request: "Request") -> None:
+        """P-side only: drop the last prompt token so the prefiller computes
+        h(N-1) instead of h(N). The decoder recomputes the last token to
+        derive h(N) correctly.
+
+        Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
+        request is preempted and rescheduled."""
+        params = request.kv_transfer_params
+        if (
+            params is not None
+            # Guard against repeated truncation after preemption/reschedule.
+            and not params.get("_p_side_truncated")
+            and request.num_prompt_tokens > 1
+        ):
+            if request.prompt_token_ids is not None:
+                request.prompt_token_ids.pop()
+            elif request.prompt_embeds is not None:
+                request.prompt_embeds = request.prompt_embeds[:-1]
+            else:
+                return
+
+            request._all_token_ids.pop()
+            request.num_prompt_tokens -= 1
+            request.max_tokens = 1
+            params["_p_side_truncated"] = True
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -529,10 +571,16 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
             token_ids = request.prompt_token_ids or []
-            count = len(token_ids) - num_computed_tokens
+            if self._use_mamba and len(token_ids) > 1:
+                # Mamba prefiller computes h(N-1) instead of h(N).
+                count = len(token_ids) - num_computed_tokens - 1
+            else:
+                count = len(token_ids) - num_computed_tokens
             if count > 0:
                 return count, True
 
+        if params.get("do_remote_decode") and self._use_mamba:
+            self._truncate_mamba_request_for_prefill(request)
         # No remote prefill for this request.
         return 0, False
 
@@ -667,6 +715,7 @@ class MooncakeConnectorScheduler:
         delay_free_blocks = sum(num_delay_free_blocks) > 0
 
         if delay_free_blocks:
+            block_ids = self.get_sw_clipped_blocks(block_ids)
             self._reqs_need_send[request.request_id] = (request, block_ids)
 
         return delay_free_blocks, None
@@ -688,8 +737,8 @@ class MooncakeConnectorScheduler:
         # For non-SWA groups, blocks_per_sw is 0 so we return all block_ids unchanged
         return tuple(
             [
-                blocks[-self.blocks_per_sw[i] :]
-                if self.blocks_per_sw[i] > 0
+                blocks[-self.num_swa_block[i] :]
+                if self.num_swa_block[i] > 0
                 else blocks
                 for i, blocks in enumerate(block_ids)
             ]
@@ -744,7 +793,7 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_blocks = 0
+        self.num_blocks = kv_cache_config.num_blocks
         self.block_len_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
 
@@ -806,9 +855,17 @@ class MooncakeConnectorWorker:
         self.cache_config = vllm_config.cache_config
         self.use_mla = self.model_config.use_mla
 
+        self.logic_kv_cache_block_scale = 1
+        self._sync_block_size_with_kernel()
+
         self.kv_cache_specs = [
             g.kv_cache_spec for g in kv_cache_config.kv_cache_groups
         ]
+        self.layer_kv_cache_spec = {
+            layer: group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            for layer in group.layer_names
+        }
         self.use_hybrid = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and any(
@@ -816,17 +873,54 @@ class MooncakeConnectorWorker:
                 for g in kv_cache_config.kv_cache_groups
             )
         )
-        self.num_swa_block = [
-            cdiv(g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size) + 1
-            if isinstance(g.kv_cache_spec, SlidingWindowSpec) else 0
+        # ---- Mamba model state (derived from model config) ----
+        self._use_mamba = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
-        ]
+        )
+        self.mamba_ssm_size: tuple[int, int] = (0, 0)
+        if self._use_mamba:
+            assert self.use_hybrid
+            # only support one mamba_ssm_size for now
+            mamba_spec = [
+                spec
+                for spec in self.kv_cache_specs
+                if isinstance(spec, MambaSpec)
+            ][0]
+            mamba_ssm_size_list: list[int] = [0, 0]
+            for size, dtype in zip(mamba_spec.shapes, mamba_spec.dtypes):
+                mamba_tensor = torch.zeros(size, dtype=dtype)
+                mamba_ssm_size_list.append(mamba_tensor.numel() * mamba_tensor.element_size())
+            assert len(mamba_ssm_size_list) == 2, (
+                "Only Mamba with both conv and ssm cache is support now. "
+            )
+            self.mamba_ssm_size = tuple(mamba_ssm_size_list)
+        # Conv state sub-projection decomposition (None when no Mamba).
+        # The 3-read transfer requires DS (dim, state_len) conv layout so
+        # that x/B/C sub-projections are contiguous in memory.
+        self._conv_decomp: MambaConvSplitInfo | None = None
+        if self._use_mamba:
+            assert is_conv_state_dim_first(), (
+                "3-read Mamba conv transfer requires DS conv state layout. "
+                "Set VLLM_SSM_CONV_STATE_LAYOUT=DS"
+            )
+            local_tp = vllm_config.parallel_config.tensor_parallel_size
+            self._conv_decomp = derive_mamba_conv_split(mamba_spec, local_tp)
         
+        # ---- Mamba-HMA per-engine state (only used when self._use_mamba) ----
+        # Per-engine transfer config (source of truth for FA/mamba sizing).
+        self._transfer_configs: dict[str, HeteroTPTransferConfig] = {}
+        # NOTE (ZhanqiuHu): _mamba_phys_ratio MUST be per-engine.
+        # compute_mamba_phys_ratio = ceil((conv_bytes + ssm_bytes) / block_len)
+        # where conv/ssm bytes are per-TP-rank (dimension-sharded).  With
+        # heterogeneous TP the per-rank sizes differ, so the ratio differs:
+        #   e.g. Nemotron 30B: P(TP=4) → 131, D(TP=1) → 261.
+        self._mamba_phys_ratio: dict[EngineId, int] = {}
 
         # Get the attention backend from the first layer
         # NOTE (NickLucche) models with multiple backends are not supported yet
-        backend = get_current_attn_backend(vllm_config)
-        self.backend_name = backend.get_name()
+        self.backends = get_current_attn_backends(vllm_config)
+        self.backend_name = self.backends[0].get_name()
         self.kv_cache_layout = get_kv_cache_layout()
         logger.debug("Detected attention backend %s", self.backend_name)
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
@@ -840,13 +934,71 @@ class MooncakeConnectorWorker:
             remote_block_size=self._block_size,  # shared state
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
-            attn_backends=[backend],
+            attn_backends=self.backends,
+            is_mamba=self._use_mamba,
         )
 
         self.async_zmq_ctx = zmq.asyncio.Context()
         self._encoder = msgspec.msgpack.Encoder()
         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+
+    def _sync_block_size_with_kernel(self) -> None:
+        backends = get_current_attn_backends(self.vllm_config)
+        kernel_block_size = select_common_block_size(self.block_size, backends)
+        # Number of blocks not accounting for kernel block mismatches
+        self.logical_num_blocks = self.num_blocks
+        if self.block_size != kernel_block_size:
+            logger.info_once(
+                "User-specified logical block size (%s) does not match" 
+                "physical kernel block size (%s). Using the latter.",
+                self.block_size,
+                kernel_block_size,
+            )
+            assert self.block_size > kernel_block_size
+            self.logic_kv_cache_block_scale = (
+                self.block_size // kernel_block_size
+            )
+            self.block_size = kernel_block_size
+            self._block_size[self.engine_id] = kernel_block_size
+            self.num_blocks *= self.logic_kv_cache_block_scale
+
+    def _maybe_get_or_create_transfer_config(
+        self, meta: MooncakeXferMetadata
+    ) -> HeteroTPTransferConfig | None:
+        """Cache per-remote-engine Mamba hetero-TP transfer planning.
+
+        Mooncake currently does not consume this config in the main transfer
+        path yet, but we cache it eagerly so the future Mamba-HMA descriptor
+        path can reuse the same per-engine planning model as NIXL.
+        """
+        if not self._use_mamba:
+            return None
+
+        engine_id = meta.engine_id
+        config = self._transfer_configs.get(engine_id)
+        if config is not None:
+            return config
+
+        self._tp_size[engine_id] = meta.remote_tp_size
+        self._mamba_phys_ratio[engine_id] = compute_mamba_phys_ratio(
+            meta.ssm_sizes, meta.block_lens[0]
+        )
+
+        config = HeteroTPTransferConfig(
+            tp_ratio=_get_tp_ratio(meta.remote_tp_size, self.tp_size),
+            K=self.kv_topo.total_num_kv_heads,
+            d_tp=meta.remote_tp_size,
+            p_tp=self.tp_size,
+            d_rank=meta.remote_tp_rank,
+            use_mla=self.use_mla,
+            d_block_len=meta.block_lens[0],
+            p_block_len=self.block_len_per_layer[0],
+            is_blocks_first=self.kv_topo.is_kv_layout_blocks_first,
+        )
+        self._transfer_configs[engine_id] = config
+        logger.info("Created Mooncake %s for remote engine %s", config.describe(), engine_id)
+        return config
 
     def __del__(self):
         self.shutdown()
@@ -977,6 +1129,7 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
+        self._maybe_get_or_create_transfer_config(meta)
         local_regions = self._get_transfer_regions(
             self.kv_caches_base_addr, self.block_len_per_layer
         )
@@ -1300,16 +1453,41 @@ class MooncakeConnectorWorker:
         kv_data_lens = []
         seen_base_addresses = []
         self.block_len_per_layer = []
+        self._is_mamba_layer: list[bool] = []
+        self._is_attn_layer: list[bool] = []
+        shared_layers_by_layer = {
+            layer_name: tuple(kv_cache_tensor.shared_by)
+            for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors
+            for layer_name in kv_cache_tensor.shared_by
+        }
 
-        split_k_and_v = self.kv_topo.split_k_and_v
-        tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
-            cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
+            layer_spec = self.layer_kv_cache_spec[layer_name]
+            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            # Use get_transfer_cache_regions to properly handle mamba layers
+            cache_list = self.kv_topo.get_transfer_cache_regions(
+                cache_or_caches, layer_spec
+            )
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
                 layer_name,
                 len(cache_list),
             )
+
+            # Calculate physical page size for this layer
+            # For mamba layers, page_size_bytes includes both conv and ssm
+            physical_page_size = layer_spec.page_size_bytes
+            if not isinstance(layer_spec, MambaSpec):
+                physical_page_size = physical_page_size // self.logic_kv_cache_block_scale
+            # For when registering multiple tensors eg K/V in separate regions
+            physical_page_size = physical_page_size // len(cache_list)
+
+            # Determine expected num_blocks for this layer
+            if isinstance(layer_spec, MambaSpec):
+                expected_num_blocks = self.logical_num_blocks
+            else:
+                expected_num_blocks = self.num_blocks
 
             for cache in cache_list:
                 self._log_debug_cache_registration(layer_name, cache)
@@ -1318,41 +1496,67 @@ class MooncakeConnectorWorker:
                     continue
 
                 seen_base_addresses.append(base_addr)
-                curr_tensor_size_bytes = cache.nbytes
+                # Use physical_page_size * expected_num_blocks for consistency
+                curr_tensor_size_bytes = physical_page_size * expected_num_blocks
 
-                if tensor_size_bytes is None:
-                    tensor_size_bytes = curr_tensor_size_bytes
-                    self.num_blocks = cache.shape[0]
-                assert cache.shape[0] == self.num_blocks, (
-                    "All kv cache tensors must have the same number of blocks"
+                assert cache.shape[0] == expected_num_blocks, (
+                    f"Layer {layer_name}: cache.shape[0]={cache.shape[0]} "
+                    f"!= expected_num_blocks={expected_num_blocks}"
                 )
-                assert curr_tensor_size_bytes % self.num_blocks == 0, (
-                    "Mooncake expects each kv cache tensor size to be "
-                    "divisible by the number of blocks."
-                )
-                self.block_len_per_layer.append(
-                    curr_tensor_size_bytes // self.num_blocks
-                )
+                
+                has_mamba = False
+                has_attn = False
+                for shared_layer_name in shared_layers_by_layer[layer_name]:
+                    shared_layer_spec = self.layer_kv_cache_spec[shared_layer_name]
+                    if isinstance(shared_layer_spec, UniformTypeKVCacheSpecs):
+                        shared_layer_spec = shared_layer_spec.kv_cache_specs[
+                            shared_layer_name
+                        ]
+                    if isinstance(shared_layer_spec, MambaSpec):
+                        has_mamba = True
+                    else:
+                        # We defaultly assume that all no-mamba layers are attn_layers
+                        has_attn = True
 
-                kernel_block_size = cache.shape[-2 if self.use_mla else -3]
-                assert self.block_size == kernel_block_size
+                self._is_mamba_layer.append(has_mamba)
+                self._is_attn_layer.append(has_attn)
+
+                self.block_len_per_layer.append(physical_page_size)
+                
+                # For mamba layers, skip the kernel_block_size check since
+                # conv_state has a different shape than attention KV cache
+                if not isinstance(layer_spec, MambaSpec):
+                    kernel_block_size = cache.shape[-2 if self.use_mla else -3]
+                    assert self.block_size == kernel_block_size
                 kv_data_ptrs.append(base_addr)
                 kv_data_lens.append(curr_tensor_size_bytes)
 
         self.kv_caches_base_addr = seen_base_addresses
         self.seen_base_addresses = seen_base_addresses
 
+        assert len(kv_data_ptrs) > 0
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
-        assert tensor_size_bytes is not None
         assert self.num_blocks != 0
         self.device_kv_caches = kv_caches
+        
+        if self._use_mamba:
+            self._mamba_phys_ratio[self.engine_id] = (
+                self.logic_kv_cache_block_scale
+            )
+            logger.info(
+                "Hybrid SSM registration: num_blocks=%s, "
+                "mamba_ssm_size=%s, block_len_per_layer=%s",
+                self.num_blocks,
+                self.mamba_ssm_size,
+                set(self.block_len_per_layer),
+            )
+        
         logger.debug(
             "registered num_blocks=%d block_lens=%s",
-            self.num_blocks,
-            self.block_len_per_layer,
+            self.num_blocks, self.block_len_per_layer,
         )
 
         # No need to launch server for D node.
@@ -1447,6 +1651,9 @@ class MooncakeConnectorWorker:
             },
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
+            ssm_sizes=self.mamba_ssm_size,
+            engine_id=self.engine_id,
+            num_blocks=self.num_blocks,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -1640,11 +1847,64 @@ class MooncakeConnectorWorker:
     def _get_transfer_regions(
         self, base_addrs: list[int], block_lens: list[int]
     ) -> list[TransferRegion]:
+        regions: list[TransferRegion] = []
+        if self._use_mamba:
+            conv_size, ssm_size = self.mamba_ssm_size
+            for i, (base_addr, block_len) in enumerate(zip(base_addrs, block_lens)):
+                if self._is_mamba_layer[i]:
+                    # For mamba layers, create two regions: conv and ssm
+                    regions.append(
+                        TransferRegion(
+                            base_addr=base_addr,
+                            block_len=block_len,
+                            kv_block_len=conv_size,
+                        )
+                    )
+                    regions.append(
+                        TransferRegion(
+                            base_addr=base_addr + conv_size,
+                            block_len=block_len,
+                            kv_block_len=ssm_size,
+                        )
+                    )
+                if self._is_attn_layer[i]:
+                    # For attention layers, use the standard expansion
+                    kv_block_len = block_len // 2 if self.kv_topo.is_kv_layout_blocks_first else block_len
+                    regions.append(
+                        TransferRegion(
+                            base_addr=base_addr,
+                            block_len=block_len,
+                            kv_block_len=kv_block_len,
+                        )
+                    )
+                    if self.kv_topo.is_kv_layout_blocks_first:
+                        regions.append(
+                            TransferRegion(
+                                base_addr=base_addr + kv_block_len,
+                                block_len=block_len,
+                                kv_block_len=kv_block_len,
+                            )
+                        )
+            return regions
         return _expand_transfer_regions(
             base_addrs=base_addrs,
             block_lens=block_lens,
             is_kv_layout_blocks_first=self.kv_topo.is_kv_layout_blocks_first,
         )
+
+    def get_backend_aware_kv_block_len(
+        self, layer_idx: int, first_split: bool, mamba_view: bool
+    ) -> int:
+        """Get the backend-aware KV block length for a given layer and split."""
+        block_len = self.block_len_per_layer[layer_idx]
+        if self.kv_topo.is_kv_layout_blocks_first:
+            block_len = block_len // 2
+        if mamba_view and self._use_mamba:
+            # For mamba, we need to adjust the block length to account for
+            # the 3-read transfer of conv state and the separate SSM state.
+            # This is handled in the mamba-specific transfer methods.
+            pass
+        return block_len
 
     def _get_sender_transfer_plan(
         self,
@@ -1662,6 +1922,145 @@ class MooncakeConnectorWorker:
             remote_kv_block_len=remote_kv_block_len,
             producer_cache_replicated=self._producer_cache_is_replicated(),
         )
+
+    def _build_mamba_local(
+        self,
+        base_addresses: list[int],
+        block_size_ratio: int,
+    ) -> list[tuple[int, int]]:
+        """Build 4 desc regions (x, B, C, ssm) per layer for local mamba
+        blocks, enabling the 3-read transfer with DS conv layout."""
+        assert block_size_ratio == 1, (
+            "Mamba 3-read transfer with block_size_ratio != 1 is not tested. "
+            f"Got block_size_ratio={block_size_ratio}."
+        )
+        assert self._conv_decomp is not None
+        conv_offsets = self._conv_decomp.local_conv_offsets
+        conv_size, ssm_size = self.mamba_ssm_size
+        num_blocks = self.logical_num_blocks * block_size_ratio
+        phys_ratio = self.logic_kv_cache_block_scale
+
+        result: list[tuple[int, int]] = []
+        for i, base_addr in enumerate(base_addresses):
+            page_stride = self.block_len_per_layer[i] // block_size_ratio * phys_ratio
+            for off, sz in conv_offsets:
+                for blk in range(num_blocks):
+                    result.append(
+                        (base_addr + blk * page_stride + off, sz)
+                    )
+            # SSM temporal state follows the conv state.
+            for blk in range(num_blocks):
+                result.append(
+                    (
+                        base_addr + blk * page_stride + conv_size,
+                        ssm_size,
+                    )
+                )
+        return result
+
+    def _build_fa_remote_for_mamba(
+        self,
+        agent_meta: MooncakeXferMetadata,
+        transfer_cfg: HeteroTPTransferConfig,
+        block_size_ratio: int,
+        kv_topo: TpKVTopology,
+    ) -> list[tuple[int, int]]:
+        """Build remote FA descriptors for mamba models.
+
+        Uses transfer_cfg for GQA-aware FA divisor and head-based rank offset
+        instead of the standard uniform tp_ratio split.
+        """
+        assert block_size_ratio == 1, (
+            "Mamba 3-read transfer with block_size_ratio != 1 is not tested. "
+            f"Got block_size_ratio={block_size_ratio}."
+        )
+        tp_ratio = transfer_cfg.tp_ratio
+        result: list[tuple[int, int]] = []
+        for i, base_addr in enumerate(agent_meta.kv_caches_base_addr):
+            local_block_len = self.get_backend_aware_kv_block_len(
+                layer_idx=i, first_split=True, mamba_view=False
+            )
+            remote_kv_block_len = local_block_len // block_size_ratio
+            if block_size_ratio > 1:
+                local_block_len = remote_kv_block_len
+
+            if tp_ratio < 0 and not self.use_mla:
+                local_block_len = local_block_len // transfer_cfg.physical_fa_num_reads
+
+            rank_offset = transfer_cfg.fa_rank_offset(remote_kv_block_len)
+
+            num_blocks = agent_meta.num_blocks
+            page_size = agent_meta.block_lens[i]
+            for block_id in range(num_blocks):
+                block_offset = block_id * page_size
+                addr = base_addr + block_offset + rank_offset
+                result.append((addr, local_block_len))
+
+            if kv_topo.is_kv_layout_blocks_first:
+                second_split = self.get_backend_aware_kv_block_len(
+                    layer_idx=i, first_split=False, mamba_view=False
+                )
+                if tp_ratio < 0 and not self.use_mla:
+                    second_split = second_split // transfer_cfg.physical_fa_num_reads
+                for block_id in range(num_blocks):
+                    block_offset = block_id * page_size
+                    addr = base_addr + block_offset + rank_offset
+                    v_addr = addr + agent_meta.block_lens[i] // 2
+                    result.append((v_addr, second_split))
+        return result
+
+    def _build_mamba_remote(
+        self,
+        agent_meta: MooncakeXferMetadata,
+        tp_ratio: int,
+    ) -> list[tuple[int, int]]:
+        """Build 4 remote desc regions (x, B, C, ssm) per layer for
+        the 3-read transfer.  For hetero-TP, each D rank reads only its
+        sub-projection slice from the P rank."""
+        assert self._conv_decomp is not None
+        effective_ratio = max(tp_ratio, 1)
+        # Mamba conv state is always TP-sharded, even when attention KV
+        # is replicated (num_kv_heads < tp_size).
+        local_offset = self.tp_rank % effective_ratio
+        conv_size_remote = agent_meta.ssm_sizes[0]
+
+        if tp_ratio >= 1:
+            # D_TP >= P_TP: P page is larger, D reads its slice.
+            conv_offsets = self._conv_decomp.remote_conv_offsets(
+                local_offset, effective_ratio
+            )
+            ssm_read_size = self.mamba_ssm_size[1]
+        else:
+            # NOTE (ZhanqiuHu): tp_ratio < 0 means P_TP > D_TP, so P pages
+            # are smaller than D's.  self._conv_decomp has D-sized dimensions,
+            # but we need P-sized offsets.  Scale down by |tp_ratio|.
+            abs_ratio = -tp_ratio
+            xb_p = self._conv_decomp.x_bytes // abs_ratio
+            bb_p = self._conv_decomp.b_bytes // abs_ratio
+            conv_offsets = [(0, xb_p), (xb_p, bb_p), (xb_p + bb_p, bb_p)]
+            ssm_read_size = agent_meta.ssm_sizes[1]
+
+        remote_ratio = self._mamba_phys_ratio[agent_meta.engine_id]
+        num_blocks = agent_meta.num_blocks // remote_ratio
+
+        result: list[tuple[int, int]] = []
+        # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
+        # block lengths vary across layers (e.g. MLA).
+        for i, base_addr in enumerate(agent_meta.kv_caches_base_addr):
+            page_stride = agent_meta.block_lens[i] * remote_ratio
+            for off, sz in conv_offsets:
+                for blk in range(num_blocks):
+                    result.append((base_addr + blk * page_stride + off, sz))
+            # SSM temporal state is also TP-sharded on the heads dimension.
+            for blk in range(num_blocks):
+                ssm_addr = (
+                    base_addr
+                    + blk * page_stride
+                    + conv_size_remote
+                    + local_offset * ssm_read_size
+                )
+                result.append((ssm_addr, ssm_read_size))
+        return result
 
     def _log_debug_cache_registration(
         self, layer_name: str, cache: torch.Tensor
